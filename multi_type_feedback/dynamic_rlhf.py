@@ -1,18 +1,21 @@
-import argparse
 from collections import defaultdict
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Any
 
 import gymnasium as gym
 import numpy as np
 import torch
+import uuid
 from pytorch_lightning import Trainer
-from pytorch_lightning.callbacks import EarlyStopping
+from pytorch_lightning.loggers import WandbLogger
 from stable_baselines3 import PPO, SAC
+from stable_baselines3.common.vec_env import DummyVecEnv, VecMonitor
+from stable_baselines3.common.callbacks import BaseCallback
+from train_baselines.exp_manager import ExperimentManager
 from torch.utils.data import DataLoader
 
 import wandb
-from multi_type_feedback.feedback_dataset import FeedbackDataset, load_flat_buffer_into_feedback_dataset
+from multi_type_feedback.feedback_dataset import BufferDataset, load_flat_buffer_into_feedback_dataset
 from multi_type_feedback.feedback_oracle import FeedbackOracle
 from multi_type_feedback.networks import (
     LightningCnnNetwork,
@@ -20,14 +23,52 @@ from multi_type_feedback.networks import (
     calculate_pairwise_loss,
     calculate_single_reward_loss,
 )
-from multi_type_feedback.utils import TrainingUtils
+from multi_type_feedback.utils import TrainingUtils, get_project_root, RewardVecEnvWrapper
 
+def one_hot_vector(k, max_val):
+    vec = np.zeros(max_val)
+    np.put(vec, k, 1)
+    return vec
+
+def vectorized_one_hot_vector(k, max_val):
+    vec = np.zeros((k.size, max_val))
+    vec[np.arange(k.size), k] = 1
+    return vec
+
+def create_matrix_vectorized(rows, cols, step):
+    """
+    Create a matrix that can be used to vectorize averaging over models
+    """
+    idx = torch.arange(0, cols).view(1, -1)
+    row_indices = torch.arange(0, rows).view(-1, 1)
+    matrix = (idx - row_indices) % step == 0
+    return matrix.float()
+
+def compute_grouped(tensor, k):
+    """
+    Compute standard deviation for groups of elements spaced k apart.
+    
+    Args:
+        tensor: Input tensor of shape (N,) where N is divisible by k
+        k: Number of predictions per input
+    
+    Returns:
+        Tensor of shape (N//k,) containing standard deviations
+    """
+    # Reshape the tensor to group related predictions together
+    n_inputs = tensor.shape[0] // k
+    reshaped = tensor.reshape(k, n_inputs).t()  # Shape: (n_inputs, k)
+    
+    # Compute standard deviation along dimension 1 (across the k predictions)
+    return torch.mean(reshaped, dim=1), torch.std(reshaped, dim=1)  # Shape: (n_inputs,)
 
 class DynamicRLHF:
     def __init__(
         self,
         oracle: FeedbackOracle,
         env: gym.Env,
+        gen_env: gym.Env,
+        env_name: str = "Pendulum-v1",
         algorithm: str = "ppo",
         feedback_types: List[str] = [
             "evaluative",
@@ -35,16 +76,22 @@ class DynamicRLHF:
             "demonstrative",
             "descriptive",
         ],
-        n_feedback_per_iteration: int = 100,
-        feedback_buffer_size: int = 1000,
-        rl_steps_per_iteration: int = 10000,
-        reward_training_epochs: int = 50,
+        n_feedback_per_iteration: int = 50,
+        feedback_buffer_size: int = 2000,
+        rl_steps_per_iteration: int = 5000,
+        reward_training_epochs: int = 2,
         device: str = "cuda",
-        enable_wandb: bool = True,
-        wandb_project_name: str = "dynamic_rlhf",
+        num_ensemble_models: int = 4,
+        callbacks: List[BaseCallback] = None,
+        hyperparams: Dict[str, Any] = None,  # Hyperparameters from ExperimentManager
+        seed: int = None,
+        wandb_logger: Any = None,
+        tensorboard_log: str = "",
     ):
         self.oracle = oracle
         self.env = env
+        self.gen_env = gen_env
+        self.env_name = env_name
         self.algorithm = algorithm
         self.feedback_types = feedback_types
         self.n_feedback_per_iteration = n_feedback_per_iteration
@@ -52,7 +99,19 @@ class DynamicRLHF:
         self.rl_steps_per_iteration = rl_steps_per_iteration
         self.reward_training_epochs = reward_training_epochs
         self.device = device
-        self.enable_wandb = enable_wandb
+        self.num_ensemble_models = num_ensemble_models
+        self.callbacks = callbacks or []
+        self._hyperparams = hyperparams or {}
+        self.seed = seed
+        self.wandb_logger = wandb_logger
+        self.tensorboard_log = tensorboard_log
+
+        unique_id = str(uuid.uuid4())[:8]
+        self.tb_log_name = f"tb_log_{unique_id}"
+        
+        self.action_one_hot = isinstance(self.env.action_space, gym.spaces.Discrete)
+        if self.action_one_hot:
+            self.one_hot_dim = self.env.action_space.n
 
         # Initialize feedback buffers for each type
         self.feedback_buffers = {feedback_type: [] for feedback_type in feedback_types}
@@ -60,33 +119,41 @@ class DynamicRLHF:
         # Initialize RL agent
         self.rl_agent = self._init_rl_agent()
 
-        # Initialize reward models for each feedback type
+        # Initialize reward models
         self.reward_models = self._init_reward_models()
 
-        if enable_wandb:
-            wandb.init(
-                project=wandb_project_name,
-                config={
-                    "algorithm": algorithm,
-                    "feedback_types": feedback_types,
-                    "n_feedback_per_iteration": n_feedback_per_iteration,
-                    "rl_steps_per_iteration": rl_steps_per_iteration,
-                },
-            )
-
     def _init_rl_agent(self):
-        """Initialize the RL agent."""
+        """Initialize the RL agent using hyperparameters from ExperimentManager."""
+        wrapped_env = RewardVecEnvWrapper(
+            self.env, 
+            reward_fn=self.compute_ensemble_reward
+        )
+
         if self.algorithm == "ppo":
-            return PPO("MlpPolicy", self.env, verbose=1, device=self.device)
+            return PPO(
+                env=wrapped_env, 
+                verbose=1, 
+                seed=self.seed,
+                device=self.device,
+                tensorboard_log=self.tensorboard_log,
+                **self._hyperparams
+            )
         else:
-            return SAC("MlpPolicy", self.env, verbose=1, device=self.device)
+            return SAC(
+                env=wrapped_env, 
+                verbose=1, 
+                seed=self.seed,
+                device=self.device,
+                tensorboard_log=self.tensorboard_log,
+                **self._hyperparams
+            )
 
     def _init_reward_models(self):
         """Initialize reward models for each feedback type."""
         reward_models = {}
 
         for feedback_type in self.feedback_types:
-            if "ALE/" in self.env.spec.id or "procgen" in self.env.spec.id:
+            if "ALE/" in self.env_name or "procgen" in self.env_name:
                 model = LightningCnnNetwork(
                     input_spaces=(self.env.observation_space, self.env.action_space),
                     hidden_dim=256,
@@ -100,7 +167,7 @@ class DynamicRLHF:
                         else calculate_pairwise_loss
                     ),
                     learning_rate=1e-5,
-                    ensemble_count=4,
+                    ensemble_count=self.num_ensemble_models,
                 )
             else:
                 model = LightningNetwork(
@@ -115,7 +182,7 @@ class DynamicRLHF:
                         else calculate_pairwise_loss
                     ),
                     learning_rate=1e-5,
-                    ensemble_count=4,
+                    ensemble_count=self.num_ensemble_models,
                 )
             reward_models[feedback_type] = model
 
@@ -128,12 +195,14 @@ class DynamicRLHF:
 
         for _ in range(n_trajectories):
             trajectory = []
-            obs, _ = self.env.reset()
-            initial_states.append(self.env.save_state(observation=obs))
+            obs, _ = self.gen_env.reset()
+            initial_states.append(self.gen_env.save_state(observation=obs))
 
             for _ in range(self.oracle.segment_len):
-                action, _ = self.rl_agent.predict(obs, deterministic=True)
-                next_obs, reward, terminated, truncated, _ = self.env.step(action)
+                action, _ = self.rl_agent.predict(obs, deterministic=False)
+                next_obs, reward, terminated, truncated, _ = self.gen_env.step(action)
+                if self.action_one_hot:
+                    action = one_hot_vector(action, self.one_hot_dim)
                 done = terminated or truncated
 
                 trajectory.append((np.expand_dims(obs, axis=0), action, reward, done))
@@ -146,19 +215,7 @@ class DynamicRLHF:
 
         return trajectories, initial_states
 
-    def update_feedback_buffers(self, new_feedback: List[Dict]):
-        """Update feedback buffers with new feedback while maintaining size limit."""
-        for feedback in new_feedback:
-            for feedback_type in feedback:
-                if feedback_type != "uncertainty":  # Skip uncertainty metadata
-                    if (
-                        len(self.feedback_buffers[feedback_type])
-                        >= self.feedback_buffer_size
-                    ):
-                        # Remove oldest feedback
-                        self.feedback_buffers[feedback_type].pop(0)
-                    self.feedback_buffers[feedback_type].append(feedback[feedback_type])
-
+    
     def compute_model_uncertainty(
         self,
         trajectory: List[Tuple[np.ndarray, np.ndarray, float, bool]],
@@ -259,72 +316,6 @@ class DynamicRLHF:
 
         return all_feedback, feedback_counts
 
-    def train_iteration(self, sampling_strategy: str = "random"):
-        """Run one iteration of the training loop."""
-        # Collect trajectories
-        trajectories, initial_states = self.collect_trajectories(
-            self.n_feedback_per_iteration
-        )
-
-        # Get feedback based on sampling strategy
-        if sampling_strategy == "random":
-            feedback, feedback_counts = self.sample_feedback_random(
-                trajectories, initial_states
-            )
-        else:  # uncertainty
-            feedback, feedback_counts = self.sample_feedback_uncertainty(
-                trajectories, initial_states
-            )
-
-        # Update feedback buffers
-        self.update_feedback_buffers(feedback)
-
-        # Ensure buffer data is in correct format before creating dataset
-        for feedback_type, buffer in self.feedback_buffers.items():
-            if buffer:
-                self.feedback_buffers[feedback_type] = [
-                    (obs, label, weight) 
-                    for obs, label, weight in buffer
-                ]
-
-        # Train reward models
-        reward_metrics = self.train_reward_models()
-
-        # Calculate mean uncertainties for logging
-        mean_uncertainties = defaultdict(list)
-        if sampling_strategy == "uncertainty":
-            for f in feedback:
-                if "selected_uncertainty" in f:
-                    mean_uncertainties["selected_uncertainty"].append(
-                        f["selected_uncertainty"]
-                    )
-
-        # Train RL agent with updated reward models
-        self.train_rl_agent()
-
-        # Log metrics
-        if self.enable_wandb:
-            metrics = {"feedback_counts": feedback_counts, **reward_metrics}
-
-            # Add uncertainty metrics if available
-            if mean_uncertainties:
-                metrics.update(
-                    {
-                        "mean_selected_uncertainty": np.mean(
-                            mean_uncertainties["selected_uncertainty"]
-                        ),
-                        "max_selected_uncertainty": np.max(
-                            mean_uncertainties["selected_uncertainty"]
-                        ),
-                        "min_selected_uncertainty": np.min(
-                            mean_uncertainties["selected_uncertainty"]
-                        ),
-                    }
-                )
-
-            wandb.log(metrics)
-
-        return feedback_counts, reward_metrics
 
     def sample_feedback_random(
         self, trajectories: List[List], initial_states: List[np.ndarray]
@@ -389,85 +380,133 @@ class DynamicRLHF:
                 continue
                 
             # Create dataset from buffer
-            dataset = FeedbackDataset(
-                load_flat_buffer_into_feedback_dataset(buffer_data, feedback_type),
-                feedback_type,
-                len(self.feedback_buffers[feedback_type]),
-                env_name=self.env.spec.id,
-                noise_level=0.0,  # No additional noise during training
-                segment_len=self.oracle.segment_len,
-                env=self.env if feedback_type == "demonstrative" else None,
+            dataset = BufferDataset(
+                buffer_data
             )
-
+    
             # Train model
             trainer = Trainer(
                 max_epochs=self.reward_training_epochs,
-                devices=[0] if self.device == "cuda" else None,
+                accelerator="auto",
+                devices="auto",
                 enable_progress_bar=False,
-                logger=None,  # We'll handle logging manually
-                callbacks=[EarlyStopping(monitor="val_loss", mode="min", patience=5)],
+                accumulate_grad_batches=32, # Virtual batch size 
+                logger=self.wandb_logger,
+                log_every_n_steps=10,
             )
-
+            
             trainer.fit(
                 self.reward_models[feedback_type],
-                DataLoader(dataset, batch_size=32, shuffle=True),
+                DataLoader(
+                    dataset,
+                    batch_size=self.num_ensemble_models,
+                    shuffle=True,
+                    pin_memory=True,
+                    drop_last=True
+                ),
             )
+    
+            # Retrieve the final logged metrics for this model
+            # "train_loss" will exist if you logged it with on_epoch=True
+            final_metrics = trainer.callback_metrics
+            
+            reward_metrics[feedback_type] = float(final_metrics.get("train_loss", -1.0))
 
-            metrics[f"{feedback_type}_loss"] = trainer.callback_metrics[
-                "val_loss"
-            ].item()
+        return reward_metrics
 
-        return metrics
 
-    def compute_ensemble_reward(self, state: np.ndarray, action: np.ndarray) -> float:
-        """Compute reward using ensemble of reward models."""
-        rewards = []
-        uncertainties = []
+    def compute_ensemble_reward(self, state: np.ndarray, action: np.ndarray) -> np.ndarray:
+        device = self.device  # or whichever device you prefer
 
-        state_tensor = torch.as_tensor(
-            state, device=self.device, dtype=torch.float32
-        ).unsqueeze(0)
-        action_tensor = torch.as_tensor(
-            action, device=self.device, dtype=torch.float32
-        ).unsqueeze(0)
+        if self.action_one_hot:
+            action = vectorized_one_hot_vector(np.array(action), self.one_hot_dim)
 
+        # add batch dimension to actions if not present (if called with non-vectorized env.)
+        if len(action.shape) < 2:
+            action = np.expand_dims(action, axis=0)
+    
+        # Convert to torch tensors of shape [batch_size, ...]
+        state_tensor = torch.as_tensor(state, device=device, dtype=torch.float32).unsqueeze(1)
+        action_tensor = torch.as_tensor(action, device=device, dtype=torch.float32).unsqueeze(1)
+    
+        # Lists to accumulate each model's [batch_size,] reward and uncertainty
+        model_rewards = []
+        model_uncertainties = []
+    
         with torch.no_grad():
             for feedback_type, reward_model in self.reward_models.items():
-                if (
-                    len(self.feedback_buffers[feedback_type]) > 0
-                ):  # Only use models with feedback
-                    if reward_model.ensemble_count > 1:
-                        state_expanded = state_tensor.expand(
-                            reward_model.ensemble_count, *state_tensor.shape[1:]
-                        )
-                        action_expanded = action_tensor.expand(
-                            reward_model.ensemble_count, *action_tensor.shape[1:]
-                        )
-                        predictions = reward_model(state_expanded, action_expanded)
-                        mean_reward = predictions.mean().item()
-                        uncertainty = predictions.std().item()
-                    else:
-                        predictions = reward_model(state_tensor, action_tensor)
-                        mean_reward = predictions.item()
-                        uncertainty = 0.0
+                # Only use models which have some feedback
+                if len(self.feedback_buffers[feedback_type]) == 0:
+                    continue
+    
+                if reward_model.ensemble_count > 1:
+                    # Expand along a new "ensemble" dimension (dim=0)
+                    # Resulting shape = [ensemble_count, batch_size, ...]
+                    st_expanded = state_tensor.repeat(
+                        reward_model.ensemble_count, *[1] * (len(state_tensor.shape) - 1)
+                    )
+                    act_expanded = action_tensor.repeat(
+                        reward_model.ensemble_count, *[1] * (len(action_tensor.shape) - 1)
+                    )
+    
+                    # predictions.shape might be [ensemble_count, batch_size]
+                    # or [ensemble_count, batch_size, 1], etc.
+                    predictions = reward_model(st_expanded, act_expanded)
+    
+                    # Make sure we reduce the final dimension if necessary
+                    if predictions.dim() == 3 and predictions.shape[-1] == 1:
+                        # e.g. shape: (ensemble_count, batch_size, 1)
+                        predictions = predictions.squeeze(-1)
+    
+                    mean_reward, uncertainty = compute_grouped(predictions, reward_model.ensemble_count)
+                else:
+                    # Single model in the ensemble
+                    predictions = reward_model(state_tensor, action_tensor)
+                    # e.g. shape: [batch_size] or [batch_size,1]
+                    if predictions.dim() == 2 and predictions.shape[1] == 1:
+                        predictions = predictions.squeeze(-1)
+                    mean_reward = predictions
+                    # Zero uncertainty
+                    uncertainty = torch.zeros_like(mean_reward)
+    
+                # Collect
+                model_rewards.append(mean_reward)         # shape [batch_size,]
+                model_uncertainties.append(uncertainty)   # shape [batch_size,]
+    
+        # If no models have feedback, return zeros for the entire batch
+        if not model_rewards:
+            return np.zeros(state.shape[0], dtype=np.float32)
+    
+        # Stack across models => shape (#models, batch_size)
+        stacked_rewards = torch.stack(model_rewards, dim=0)
+        stacked_uncerts = torch.stack(model_uncertainties, dim=0)
+    
+        # final_rewards => shape [batch_size,]
+        batch_size = state.shape[0]
+        final_rewards = torch.zeros(batch_size, device=device, dtype=torch.float32)
+    
+        # Loop over each environment in the batch
+        for i in range(batch_size):
+            # For the i-th environment, gather all model rewards/uncertainties
+            r_i = stacked_rewards[:, i]   # shape (#models,)
+            u_i = stacked_uncerts[:, i]   # shape (#models,)
+    
+            if torch.any(u_i > 0):
+                # If any model has a positive uncertainty, weight by 1 / uncertainty
+                w_i = torch.where(u_i > 0, 1.0 / u_i, torch.ones_like(u_i))
+                # Normalize weights
+                w_i /= w_i.sum()
+                final_rewards[i] = (r_i * w_i).sum()
+            else:
+                # Otherwise, just average over the models
+                final_rewards[i] = r_i.mean()
+    
+        return final_rewards.cpu().numpy()  # shape: [batch_size,]
 
-                    rewards.append(mean_reward)
-                    uncertainties.append(uncertainty)
-
-        if not rewards:  # If no models have feedback yet
-            return 0.0
-
-        # Weight rewards by inverse uncertainty
-        if any(u > 0 for u in uncertainties):
-            weights = [1 / u if u > 0 else 1.0 for u in uncertainties]
-            weights = [w / sum(weights) for w in weights]
-            final_reward = sum(r * w for r, w in zip(rewards, weights))
-        else:
-            final_reward = sum(rewards) / len(rewards)
-
-        return final_reward
 
     def train_iteration(self, sampling_strategy: str = "random"):
+        """Run one iteration of the training loop."""
+        # Collect trajectories
         """Run one iteration of the training loop."""
         # Collect trajectories
         trajectories, initial_states = self.collect_trajectories(
@@ -483,7 +522,7 @@ class DynamicRLHF:
             feedback, feedback_counts = self.sample_feedback_uncertainty(
                 trajectories, initial_states
             )
-
+        
         # Update feedback buffers
         self.update_feedback_buffers(feedback)
 
@@ -494,7 +533,7 @@ class DynamicRLHF:
         self.train_rl_agent()
 
         # Log metrics
-        if self.enable_wandb:
+        if self.wandb_logger is not None:
             metrics = {"feedback_counts": feedback_counts, **reward_metrics}
             wandb.log(metrics)
 
@@ -502,29 +541,23 @@ class DynamicRLHF:
 
     def train_rl_agent(self):
         """Train RL agent using current reward models."""
-
-        # Create a reward wrapper for the environment
-        class RewardWrapper(gym.Wrapper):
-            def __init__(self, env, reward_fn):
-                super().__init__(env)
-                self.reward_fn = reward_fn
-
-            def step(self, action):
-                obs, _, terminated, truncated, info = super().step(action)
-                reward = self.reward_fn(obs, action)
-                return obs, reward, terminated, truncated, info
-
-        # Wrap environment with ensemble reward
-        wrapped_env = RewardWrapper(self.env, self.compute_ensemble_reward)
-
-        # Update environment reference in RL agent
-        self.rl_agent.env = wrapped_env
-
-        # Train for specified number of steps
-        self.rl_agent.learn(total_timesteps=self.rl_steps_per_iteration)
+        # Use callbacks if provided
+        callback = None if not self.callbacks else self.callbacks
+        
+        self.rl_agent.learn(
+            total_timesteps=self.rl_steps_per_iteration,
+            reset_num_timesteps=False,
+            callback=callback,
+            tb_log_name=self.tb_log_name,
+        )
 
     def train(self, total_iterations: int, sampling_strategy: str = "random"):
         """Run full training loop for specified number of iterations."""
+        # Initialize callbacks if they exist
+        if self.callbacks:
+            for callback in self.callbacks:
+                callback.init_callback(self.rl_agent)
+
         for iteration in range(total_iterations):
             print(f"\nIteration {iteration + 1}/{total_iterations}")
 
@@ -539,9 +572,13 @@ class DynamicRLHF:
             for feedback_type, loss in reward_metrics.items():
                 print(f"{feedback_type}: {loss:.4f}")
 
-        if self.enable_wandb:
+        if self.wandb_logger is not None:
             wandb.finish()
 
+        # Cleanup callbacks if they exist
+        if self.callbacks:
+            for callback in self.callbacks:
+                callback.on_training_end()
 
 def main():
     parser = TrainingUtils.setup_base_parser()
@@ -549,7 +586,8 @@ def main():
         "--feedback-types",
         nargs="+",
         type=str,
-        default=["evaluative", "comparative", "demonstrative", "descriptive"],
+        #default=["evaluative", "comparative", "demonstrative", "descriptive", "corrective", "descriptive_preference"],
+        default=["evaluative", "comparative", "demonstrative", "corrective"],
         help="Types of feedback to use",
     )
     parser.add_argument(
@@ -560,57 +598,156 @@ def main():
         help="Feedback sampling strategy",
     )
     parser.add_argument(
-        "--save-folder", type=str, default="feedback", help="Save folder"
+        "--save-folder",
+        type=str,
+        default="trained_agents",
+        help="Folder for finished feedback RL agents",
     )
     parser.add_argument(
-        "--total-iterations",
+        "--reference-data-folder",
+        type=str,
+        default="feedback",
+        help="Folder containing pre-computed offline feedback for calibration",
+    )
+    parser.add_argument(
+        "--n-feedback-per-iteration",
         type=int,
-        default=100,
+        default=30,
+        help="Feedback Instances collected per iteration",
+    )
+    parser.add_argument(
+        "--rl-steps-per-iteration",
+        type=int,
+        default=5000,
         help="Number of training iterations",
     )
     parser.add_argument(
-        "--top-n-models", type=int, default=3, help="Top N models to use"
+        "--n-timesteps",
+        type=int,
+        default=-1,
+        help="Overwrite for RL training timesteps",
+    )
+    parser.add_argument(
+        "--reward-training-epochs",
+        type=int,
+        default=5,
+        help="Number of epochs",
+    )
+    parser.add_argument(
+        "--top-n-models", 
+        type=int, 
+        default=3, 
+        help="Top N models to use"
+    )
+    parser.add_argument(
+        "--expert-model-base-path", 
+        type=str, 
+        default="train_baselines/gt_agents", 
+        help="Expert model base path"
+    )
+    parser.add_argument(
+        "--feedback-buffer-size",
+        type=int,
+        default=1000,
+        help="Maximum size of the feedback buffer",
+    )
+    parser.add_argument(
+        "--num-ensemble-models",
+        type=int,
+        default=4,
+        help="Number of ensemble models for masksemble",
     )
     args = parser.parse_args()
 
-    TrainingUtils.set_seeds(args.seed)
-    device = TrainingUtils.get_device()
-
+    # Setup oracle
     feedback_id, _ = TrainingUtils.get_model_ids(args)
-    feedback_path = (
-        Path(__file__).parents[1].resolve() / args.save_folder / f"{feedback_id}.pkl"
-    )
+    device = TrainingUtils.get_device()
+    feedback_path = Path(args.reference_data_folder) / f"{feedback_id}.pkl"
 
-    environment = TrainingUtils.setup_environment(args.environment, args.seed)
+    gen_environment = TrainingUtils.setup_environment(args.environment, args.seed)
     expert_models = TrainingUtils.load_expert_models(
-        args.environment,
-        args.algorithm,
-        "../main/gt_agents",
-        environment,
-        args.top_n_models,
+        env_name=args.environment,
+        algorithm=args.algorithm,
+        checkpoints_path=str(get_project_root() / args.expert_model_base_path),
+        environment=gen_environment,
+        top_n_models=args.top_n_models,
     )
 
-    # Initialize oracle
     oracle = FeedbackOracle(
         expert_models=expert_models,
-        environment=environment,
+        environment=gen_environment,
         reference_data_path=feedback_path,
+        noise_level=args.noise_level,
+    )
+    unique_id = str(uuid.uuid4())[:8]
+    
+    #try:
+    wandb.init(
+        name=f"DYNAMIC_RL_{args.algorithm}_{args.environment}_{','.join(args.feedback_types)}_{unique_id}",
+        project=args.wandb_project_name,
+        config={
+            "algorithm": args.algorithm,
+            "feedback_types": args.feedback_types,
+            "n_feedback_per_iteration": args.n_feedback_per_iteration,
+            "rl_steps_per_iteration": args.rl_steps_per_iteration,
+            "reward_training_epochs": args.reward_training_epochs,
+            "feedback_buffer_size": args.feedback_buffer_size,
+        },
+        sync_tensorboard=True,
     )
 
-    # Initialize RLHF trainer
-    rlhf = DynamicRLHF(
+    wandb_logger = WandbLogger(
+        #roject=wandb_project_name,
+        #name=f"DYNAMIC_RL_{algorithm}_{env_name}_{','.join(feedback_types)}",
+    )
+    #except:
+    #    print("Could not initialze W&B")
+    #    wandb_logger = None
+
+    # Create expert manager
+    exp_manager = ExperimentManager(
+        args=args,
+        algo=args.algorithm,
+        env_id=args.environment,
+        log_folder=args.save_folder,
+        eval_freq=5000,
+        n_eval_episodes=5,
+        use_wandb_callback=True,
+        tensorboard_log="tb_logs",
+    )
+
+    # Setup experiment and get hyperparameters
+    hyperparams = exp_manager.get_hyperparam_config_for_algo()
+
+    # Create environment
+    rl_env = exp_manager.create_envs(n_envs=exp_manager.n_envs)
+
+    # Create DynamicRLHF with ExperimentManager's hyperparameters and callbacks
+    drlhf = DynamicRLHF(
         oracle=oracle,
-        env=environment,
+        env=rl_env,
+        gen_env=gen_environment, # normal gym env for creating trajectories
+        env_name=args.environment,
         algorithm=args.algorithm,
         feedback_types=args.feedback_types,
-        wandb_project_name=args.wandb_project_name,
+        n_feedback_per_iteration=args.n_feedback_per_iteration,
+        feedback_buffer_size=args.feedback_buffer_size,
+        rl_steps_per_iteration=args.rl_steps_per_iteration,
+        reward_training_epochs=args.reward_training_epochs,
+        num_ensemble_models=args.num_ensemble_models,
+        hyperparams=hyperparams,
+        callbacks=exp_manager.callbacks,
+        device=device,
+        wandb_logger=wandb_logger,
+        tensorboard_log=exp_manager.tensorboard_log,
+        seed=args.seed,
     )
 
-    # Run training
-    rlhf.train(
-        total_iterations=args.total_iterations, sampling_strategy=args.sampling_strategy
-    )
+    # Train
 
+    n_timesteps = args.n_timesteps if args.n_timesteps > 0 else exp_manager.n_timesteps
+    total_iterations = max(1, n_timesteps // drlhf.rl_steps_per_iteration)
+    drlhf.train(total_iterations=total_iterations, sampling_strategy="random")
 
 if __name__ == "__main__":
     main()
