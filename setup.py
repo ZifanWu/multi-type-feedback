@@ -21,7 +21,8 @@ setup(
     install_requires=[
         "torch",
         "torchvision",
-        "gymnasium==1.0.0",
+        "swig",
+        "gymnasium[box2d]==1.0.0",
         "lightning",
         "minigrid",
         "mujoco",
