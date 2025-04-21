@@ -8,16 +8,21 @@ import gymnasium as gym
 import numpy as np
 import pandas as pd
 import torch
+import wandb
 from gymnasium.wrappers import FrameStackObservation, TransformObservation
 from minigrid.wrappers import FlatObsWrapper
-from train_baselines.utils import ppo_make_metaworld_env
-from train_baselines.wrappers import Gym3ToGymnasium
 from stable_baselines3 import PPO, SAC
 from stable_baselines3.common.atari_wrappers import AtariWrapper
-from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize, VecEnv, VecEnvWrapper
+from stable_baselines3.common.vec_env import (
+    DummyVecEnv,
+    VecEnv,
+    VecEnvWrapper,
+    VecNormalize,
+)
 
-import wandb
 from multi_type_feedback.save_reset_wrapper import SaveResetEnvWrapper
+from train_baselines.utils import ppo_make_metaworld_env
+from train_baselines.wrappers import Gym3ToGymnasium
 
 try:
     import minigrid
@@ -33,6 +38,7 @@ try:
     from procgen import ProcgenGym3Env
 except ImportError:
     print("Cannot import procgen")
+
 
 class TrainingUtils:
     @staticmethod
@@ -208,6 +214,7 @@ class TrainingUtils:
             save_code=False,
         )
 
+
 def get_project_root() -> Path:
     """Get the project root directory."""
     current_file = Path(__file__).resolve()
@@ -220,11 +227,12 @@ class RewardVecEnvWrapper(VecEnvWrapper):
     """
     A vectorized environment wrapper that modifies the reward
     using a user-defined reward function `reward_fn`.
-    
+
     :param venv: The vectorized environment to wrap.
     :param reward_fn: A callable that takes in (observations, actions)
                       and returns a modified reward vector.
     """
+
     def __init__(self, venv: VecEnv, reward_fn):
         super().__init__(venv)
         self.reward_fn = reward_fn
@@ -256,4 +264,3 @@ class RewardVecEnvWrapper(VecEnvWrapper):
         Reset the environment and return initial observations.
         """
         return self.venv.reset()
-

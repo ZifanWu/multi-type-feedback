@@ -1,21 +1,19 @@
+import uuid
 from collections import defaultdict
 from pathlib import Path
-from typing import Dict, List, Tuple, Any
+from typing import Any, Dict, List, Tuple
 
 import gymnasium as gym
 import numpy as np
 import torch
-import uuid
+import wandb
 from pytorch_lightning import Trainer
 from pytorch_lightning.loggers import WandbLogger
 from stable_baselines3 import PPO, SAC
-from stable_baselines3.common.vec_env import DummyVecEnv, VecMonitor
 from stable_baselines3.common.callbacks import BaseCallback
-from train_baselines.exp_manager import ExperimentManager
 from torch.utils.data import DataLoader
 
-import wandb
-from multi_type_feedback.feedback_dataset import BufferDataset, load_flat_buffer_into_feedback_dataset
+from multi_type_feedback.feedback_dataset import BufferDataset
 from multi_type_feedback.feedback_oracle import FeedbackOracle
 from multi_type_feedback.networks import (
     LightningCnnNetwork,
@@ -23,17 +21,25 @@ from multi_type_feedback.networks import (
     calculate_pairwise_loss,
     calculate_single_reward_loss,
 )
-from multi_type_feedback.utils import TrainingUtils, get_project_root, RewardVecEnvWrapper
+from multi_type_feedback.utils import (
+    RewardVecEnvWrapper,
+    TrainingUtils,
+    get_project_root,
+)
+from train_baselines.exp_manager import ExperimentManager
+
 
 def one_hot_vector(k, max_val):
     vec = np.zeros(max_val)
     np.put(vec, k, 1)
     return vec
 
+
 def vectorized_one_hot_vector(k, max_val):
     vec = np.zeros((k.size, max_val))
     vec[np.arange(k.size), k] = 1
     return vec
+
 
 def create_matrix_vectorized(rows, cols, step):
     """
@@ -44,23 +50,25 @@ def create_matrix_vectorized(rows, cols, step):
     matrix = (idx - row_indices) % step == 0
     return matrix.float()
 
+
 def compute_grouped(tensor, k):
     """
     Compute standard deviation for groups of elements spaced k apart.
-    
+
     Args:
         tensor: Input tensor of shape (N,) where N is divisible by k
         k: Number of predictions per input
-    
+
     Returns:
         Tensor of shape (N//k,) containing standard deviations
     """
     # Reshape the tensor to group related predictions together
     n_inputs = tensor.shape[0] // k
     reshaped = tensor.reshape(k, n_inputs).t()  # Shape: (n_inputs, k)
-    
+
     # Compute standard deviation along dimension 1 (across the k predictions)
     return torch.mean(reshaped, dim=1), torch.std(reshaped, dim=1)  # Shape: (n_inputs,)
+
 
 class DynamicRLHF:
     def __init__(
@@ -108,7 +116,7 @@ class DynamicRLHF:
 
         unique_id = str(uuid.uuid4())[:8]
         self.tb_log_name = f"tb_log_{unique_id}"
-        
+
         self.action_one_hot = isinstance(self.env.action_space, gym.spaces.Discrete)
         if self.action_one_hot:
             self.one_hot_dim = self.env.action_space.n
@@ -125,27 +133,26 @@ class DynamicRLHF:
     def _init_rl_agent(self):
         """Initialize the RL agent using hyperparameters from ExperimentManager."""
         wrapped_env = RewardVecEnvWrapper(
-            self.env, 
-            reward_fn=self.compute_ensemble_reward
+            self.env, reward_fn=self.compute_ensemble_reward
         )
 
         if self.algorithm == "ppo":
             return PPO(
-                env=wrapped_env, 
-                verbose=1, 
+                env=wrapped_env,
+                verbose=1,
                 seed=self.seed,
                 device=self.device,
                 tensorboard_log=self.tensorboard_log,
-                **self._hyperparams
+                **self._hyperparams,
             )
         else:
             return SAC(
-                env=wrapped_env, 
-                verbose=1, 
+                env=wrapped_env,
+                verbose=1,
                 seed=self.seed,
                 device=self.device,
                 tensorboard_log=self.tensorboard_log,
-                **self._hyperparams
+                **self._hyperparams,
             )
 
     def _init_reward_models(self):
@@ -215,7 +222,6 @@ class DynamicRLHF:
 
         return trajectories, initial_states
 
-    
     def compute_model_uncertainty(
         self,
         trajectory: List[Tuple[np.ndarray, np.ndarray, float, bool]],
@@ -316,7 +322,6 @@ class DynamicRLHF:
 
         return all_feedback, feedback_counts
 
-
     def sample_feedback_random(
         self, trajectories: List[List], initial_states: List[np.ndarray]
     ) -> Dict:
@@ -337,7 +342,7 @@ class DynamicRLHF:
             trajectories, initial_states, selected_types
         ):
             feedback_dict = {}
-            
+
             # Handle different feedback types
             if feedback_type in ["comparative", "descriptive_preference"]:
                 # Need a second trajectory for comparison
@@ -354,7 +359,7 @@ class DynamicRLHF:
                 feedback = self.oracle.get_feedback(
                     trajectory, initial_state, feedback_type
                 )
-            
+
             feedback_dict[feedback_type] = feedback
             feedback_counts[feedback_type] += 1
             all_feedback.append(feedback_dict)
@@ -366,35 +371,37 @@ class DynamicRLHF:
         for feedback_dict in new_feedback:
             for feedback_type, feedback in feedback_dict.items():
                 if feedback_type != "uncertainty":  # Skip uncertainty metadata
-                    if len(self.feedback_buffers[feedback_type]) >= self.feedback_buffer_size:
+                    if (
+                        len(self.feedback_buffers[feedback_type])
+                        >= self.feedback_buffer_size
+                    ):
                         # Remove oldest feedback
                         self.feedback_buffers[feedback_type].pop(0)
                     self.feedback_buffers[feedback_type].append(feedback)
 
     def train_reward_models(self):
         reward_metrics = {}
-        
+
         for feedback_type in self.feedback_types:
             buffer_data = self.feedback_buffers[feedback_type]
+            print("BUFFER DATA", buffer_data)
             if not buffer_data:
                 continue
-                
+
             # Create dataset from buffer
-            dataset = BufferDataset(
-                buffer_data
-            )
-    
+            dataset = BufferDataset(buffer_data)
+
             # Train model
             trainer = Trainer(
                 max_epochs=self.reward_training_epochs,
                 accelerator="auto",
                 devices="auto",
                 enable_progress_bar=False,
-                accumulate_grad_batches=32, # Virtual batch size 
+                accumulate_grad_batches=32,  # Virtual batch size
                 logger=self.wandb_logger,
                 log_every_n_steps=10,
             )
-            
+
             trainer.fit(
                 self.reward_models[feedback_type],
                 DataLoader(
@@ -402,20 +409,21 @@ class DynamicRLHF:
                     batch_size=self.num_ensemble_models,
                     shuffle=True,
                     pin_memory=True,
-                    drop_last=True
+                    drop_last=True,
                 ),
             )
-    
+
             # Retrieve the final logged metrics for this model
             # "train_loss" will exist if you logged it with on_epoch=True
             final_metrics = trainer.callback_metrics
-            
+
             reward_metrics[feedback_type] = float(final_metrics.get("train_loss", -1.0))
 
         return reward_metrics
 
-
-    def compute_ensemble_reward(self, state: np.ndarray, action: np.ndarray) -> np.ndarray:
+    def compute_ensemble_reward(
+        self, state: np.ndarray, action: np.ndarray
+    ) -> np.ndarray:
         device = self.device  # or whichever device you prefer
 
         if self.action_one_hot:
@@ -424,41 +432,49 @@ class DynamicRLHF:
         # add batch dimension to actions if not present (if called with non-vectorized env.)
         if len(action.shape) < 2:
             action = np.expand_dims(action, axis=0)
-    
+
         # Convert to torch tensors of shape [batch_size, ...]
-        state_tensor = torch.as_tensor(state, device=device, dtype=torch.float32).unsqueeze(1)
-        action_tensor = torch.as_tensor(action, device=device, dtype=torch.float32).unsqueeze(1)
-    
+        state_tensor = torch.as_tensor(
+            state, device=device, dtype=torch.float32
+        ).unsqueeze(1)
+        action_tensor = torch.as_tensor(
+            action, device=device, dtype=torch.float32
+        ).unsqueeze(1)
+
         # Lists to accumulate each model's [batch_size,] reward and uncertainty
         model_rewards = []
         model_uncertainties = []
-    
+
         with torch.no_grad():
             for feedback_type, reward_model in self.reward_models.items():
                 # Only use models which have some feedback
                 if len(self.feedback_buffers[feedback_type]) == 0:
                     continue
-    
+
                 if reward_model.ensemble_count > 1:
                     # Expand along a new "ensemble" dimension (dim=0)
                     # Resulting shape = [ensemble_count, batch_size, ...]
                     st_expanded = state_tensor.repeat(
-                        reward_model.ensemble_count, *[1] * (len(state_tensor.shape) - 1)
+                        reward_model.ensemble_count,
+                        *[1] * (len(state_tensor.shape) - 1),
                     )
                     act_expanded = action_tensor.repeat(
-                        reward_model.ensemble_count, *[1] * (len(action_tensor.shape) - 1)
+                        reward_model.ensemble_count,
+                        *[1] * (len(action_tensor.shape) - 1),
                     )
-    
+
                     # predictions.shape might be [ensemble_count, batch_size]
                     # or [ensemble_count, batch_size, 1], etc.
                     predictions = reward_model(st_expanded, act_expanded)
-    
+
                     # Make sure we reduce the final dimension if necessary
                     if predictions.dim() == 3 and predictions.shape[-1] == 1:
                         # e.g. shape: (ensemble_count, batch_size, 1)
                         predictions = predictions.squeeze(-1)
-    
-                    mean_reward, uncertainty = compute_grouped(predictions, reward_model.ensemble_count)
+
+                    mean_reward, uncertainty = compute_grouped(
+                        predictions, reward_model.ensemble_count
+                    )
                 else:
                     # Single model in the ensemble
                     predictions = reward_model(state_tensor, action_tensor)
@@ -468,29 +484,29 @@ class DynamicRLHF:
                     mean_reward = predictions
                     # Zero uncertainty
                     uncertainty = torch.zeros_like(mean_reward)
-    
+
                 # Collect
-                model_rewards.append(mean_reward)         # shape [batch_size,]
-                model_uncertainties.append(uncertainty)   # shape [batch_size,]
-    
+                model_rewards.append(mean_reward)  # shape [batch_size,]
+                model_uncertainties.append(uncertainty)  # shape [batch_size,]
+
         # If no models have feedback, return zeros for the entire batch
         if not model_rewards:
             return np.zeros(state.shape[0], dtype=np.float32)
-    
+
         # Stack across models => shape (#models, batch_size)
         stacked_rewards = torch.stack(model_rewards, dim=0)
         stacked_uncerts = torch.stack(model_uncertainties, dim=0)
-    
+
         # final_rewards => shape [batch_size,]
         batch_size = state.shape[0]
         final_rewards = torch.zeros(batch_size, device=device, dtype=torch.float32)
-    
+
         # Loop over each environment in the batch
         for i in range(batch_size):
             # For the i-th environment, gather all model rewards/uncertainties
-            r_i = stacked_rewards[:, i]   # shape (#models,)
-            u_i = stacked_uncerts[:, i]   # shape (#models,)
-    
+            r_i = stacked_rewards[:, i]  # shape (#models,)
+            u_i = stacked_uncerts[:, i]  # shape (#models,)
+
             if torch.any(u_i > 0):
                 # If any model has a positive uncertainty, weight by 1 / uncertainty
                 w_i = torch.where(u_i > 0, 1.0 / u_i, torch.ones_like(u_i))
@@ -500,9 +516,8 @@ class DynamicRLHF:
             else:
                 # Otherwise, just average over the models
                 final_rewards[i] = r_i.mean()
-    
-        return final_rewards.cpu().numpy()  # shape: [batch_size,]
 
+        return final_rewards.cpu().numpy()  # shape: [batch_size,]
 
     def train_iteration(self, sampling_strategy: str = "random"):
         """Run one iteration of the training loop."""
@@ -522,7 +537,7 @@ class DynamicRLHF:
             feedback, feedback_counts = self.sample_feedback_uncertainty(
                 trajectories, initial_states
             )
-        
+
         # Update feedback buffers
         self.update_feedback_buffers(feedback)
 
@@ -543,7 +558,7 @@ class DynamicRLHF:
         """Train RL agent using current reward models."""
         # Use callbacks if provided
         callback = None if not self.callbacks else self.callbacks
-        
+
         self.rl_agent.learn(
             total_timesteps=self.rl_steps_per_iteration,
             reset_num_timesteps=False,
@@ -580,13 +595,14 @@ class DynamicRLHF:
             for callback in self.callbacks:
                 callback.on_training_end()
 
+
 def main():
     parser = TrainingUtils.setup_base_parser()
     parser.add_argument(
         "--feedback-types",
         nargs="+",
         type=str,
-        #default=["evaluative", "comparative", "demonstrative", "descriptive", "corrective", "descriptive_preference"],
+        # default=["evaluative", "comparative", "demonstrative", "descriptive", "corrective", "descriptive_preference"],
         default=["evaluative", "comparative", "demonstrative", "corrective"],
         help="Types of feedback to use",
     )
@@ -634,16 +650,13 @@ def main():
         help="Number of epochs",
     )
     parser.add_argument(
-        "--top-n-models", 
-        type=int, 
-        default=3, 
-        help="Top N models to use"
+        "--top-n-models", type=int, default=3, help="Top N models to use"
     )
     parser.add_argument(
-        "--expert-model-base-path", 
-        type=str, 
-        default="train_baselines/gt_agents", 
-        help="Expert model base path"
+        "--expert-model-base-path",
+        type=str,
+        default="train_baselines/gt_agents",
+        help="Expert model base path",
     )
     parser.add_argument(
         "--feedback-buffer-size",
@@ -656,6 +669,12 @@ def main():
         type=int,
         default=4,
         help="Number of ensemble models for masksemble",
+    )
+    parser.add_argument(
+        "--expert-model-base-path",
+        type=str,
+        default="train_baselines/gt_agents",
+        help="Expert model base path",
     )
     args = parser.parse_args()
 
@@ -680,8 +699,8 @@ def main():
         noise_level=args.noise_level,
     )
     unique_id = str(uuid.uuid4())[:8]
-    
-    #try:
+
+    # try:
     wandb.init(
         name=f"DYNAMIC_RL_{args.algorithm}_{args.environment}_{','.join(args.feedback_types)}_{unique_id}",
         project=args.wandb_project_name,
@@ -697,10 +716,10 @@ def main():
     )
 
     wandb_logger = WandbLogger(
-        #roject=wandb_project_name,
-        #name=f"DYNAMIC_RL_{algorithm}_{env_name}_{','.join(feedback_types)}",
+        # roject=wandb_project_name,
+        # name=f"DYNAMIC_RL_{algorithm}_{env_name}_{','.join(feedback_types)}",
     )
-    #except:
+    # except:
     #    print("Could not initialze W&B")
     #    wandb_logger = None
 
@@ -726,7 +745,7 @@ def main():
     drlhf = DynamicRLHF(
         oracle=oracle,
         env=rl_env,
-        gen_env=gen_environment, # normal gym env for creating trajectories
+        gen_env=gen_environment,  # normal gym env for creating trajectories
         env_name=args.environment,
         algorithm=args.algorithm,
         feedback_types=args.feedback_types,
@@ -748,6 +767,7 @@ def main():
     n_timesteps = args.n_timesteps if args.n_timesteps > 0 else exp_manager.n_timesteps
     total_iterations = max(1, n_timesteps // drlhf.rl_steps_per_iteration)
     drlhf.train(total_iterations=total_iterations, sampling_strategy="random")
+
 
 if __name__ == "__main__":
     main()

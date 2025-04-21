@@ -39,5 +39,7 @@ setup(
         f"masksembles @ {get_abs_path('dependencies/masksembles')}",
         f"train_baselines @ {get_abs_path('train_baselines')}",
     ],
+    # install requires for tests
+    tests_require=["pytest", "black", "ruff", "pytest-cov", "mypy"],
     python_requires=">=3.9",
 )
