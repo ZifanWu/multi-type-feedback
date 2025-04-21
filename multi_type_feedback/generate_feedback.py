@@ -661,7 +661,7 @@ def main():
     parser.add_argument(
         "--expert-model-base-path",
         type=str,
-        default="train_baselines/gt_agents",
+        default="gt_agents",
         help="Expert model base path",
     )
     args = parser.parse_args()
