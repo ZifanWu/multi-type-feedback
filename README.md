@@ -14,16 +14,16 @@ This repository contains code for training and evaluating reinforcement learning
 
 ## Main Components
 
-### 1. Initial Training (`train_baselines/train.py`)
+### 1. Initial training (`train_baselines/train.py`)
 
-Trains PPO agents on various environments:
+Trains PPO agents in various environments:
 
 ```bash
 python train_baselines/train.py --algo ppo --env <environment> --verbose 0 --save-freq <frequency> --seed <seed> --gym-packages procgen ale_py --log-folder gt_agents
 ```
 
 Environments: Ant-v5, Swimmer-v5, HalfCheetah-v5, Hopper-v5, Atari, Procgen, ...
-Info: Please make sure to use train_baselines/gt_agents as the log folder, to esnure compatability with generation-script, however you can adapt the expert model dirs in necessary.
+Info: Please use train_baselines/gt_agents as the log folder to ensure compatibility with the generation script. However, you can adapt the expert model dirs if necessary.
 
 ### 2. Feedback Generation (`multi_type_feedback/generate_feedback.py`)
 
@@ -33,7 +33,7 @@ Generates feedback for trained agents:
 python multi_type_feedback/generate_feedback.py --algorithm ppo --environment <env> --seed <seed> --n-feedback 10000 --save-folder feedback
 ```
 
-Note: The script looks in the gt_agents folder for trained agents. Abd expects that the `python train_baselines/train_baselines/benchmark.py` script has been run to generate the evaluation scores.
+Note: The script looks in the gt_agents folder for trained agents. It expects that the `python train_baselines/train_baselines/benchmark.py` script has been run to generate the evaluation scores.
 
 ### 3. Reward Model Training (`multi_type_feedback/train_reward_model.py`)
 
@@ -66,7 +66,7 @@ Feedback types: evaluative, comparative, demonstrative, corrective, descriptive,
 ## Usage
 
 1. Install the package using `pip install -e .`
-2. Run initial training (e.g. with `train_baselines/start_training.sh`)
+2. Run initial training (e.g., with `train_baselines/start_training.sh`)
 3. Generate feedback
 4. Train reward models
 5. Train agents with learned rewards
