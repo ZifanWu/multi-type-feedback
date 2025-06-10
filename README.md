@@ -22,8 +22,15 @@ Trains PPO agents in various environments:
 python train_baselines/train.py --algo ppo --env <environment> --verbose 0 --save-freq <frequency> --seed <seed> --gym-packages procgen ale_py --log-folder gt_agents
 ```
 
+In the paper, we trained the Mujoco environments HalfCheetah-v5, Swimmer-v5, and Walker2d-v5, as well as the Highway-env environments with PPO.
+We recommend to train other continuous control environments, including Ant-v5, Hopper-v5, Humanoid-v5 and Metaworld environments with SAC:
+
+```bash
+python train_baselines/train.py --algo sac --env <Ant-v5|Hopper-v5|metaworld-sweep-into-v2|...> --verbose 0 --save-freq <frequency> --seed <seed> --gym-packages procgen ale_py --log-folder gt_agents
+```
+
 Environments: Ant-v5, Swimmer-v5, HalfCheetah-v5, Hopper-v5, Atari, Procgen, ...
-Info: Please use train_baselines/gt_agents as the log folder to ensure compatibility with the generation script. However, you can adapt the expert model dirs if necessary.
+Info: Please use gt_agents as the log folder to ensure compatibility with the generation script. However, you can adapt the expert model dirs if necessary.
 
 ### 2. Feedback Generation (`multi_type_feedback/generate_feedback.py`)
 
@@ -34,6 +41,16 @@ python multi_type_feedback/generate_feedback.py --algorithm ppo --environment <e
 ```
 
 Note: The script looks in the gt_agents folder for trained agents. It expects that the `python train_baselines/train_baselines/benchmark.py` script has been run to generate the evaluation scores.
+
+### 2.5 Random Samples for Demonstrative Feedback (`multi_type_feedback/generate_samples.py`)
+
+For demonstrative feedback, we utilize random feedback for simulated preference pairs. To generate the random samples, you need to run a separate script:
+
+```bash
+python multi_type_feedback/generate_samples.py --algorithm <ppo|sac> --environment <env> --n-feedback 10000 --random
+```
+
+This script generates random samples in a separate `samples` directory. If you encounter errors like `FileNotFoundError: [Errno 2] No such file or directory: 'samples/random_HalfCheetah-v5.pkl`, be sure first to run the random sample generation script.
 
 ### 3. Reward Model Training (`multi_type_feedback/train_reward_model.py`)
 
