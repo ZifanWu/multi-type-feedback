@@ -9,8 +9,8 @@ This repository contains code for training and evaluating reinforcement learning
 - `train_baselines/`: Main training scripts (Main is a fork of `Stable Baselines3 Zoo`, not by the authors of this repository)
 - `multi_type_feedback/`: Scripts for reward model training and agent training with learned rewards
 - `setup.sh`: Setup script for the environment
-- `dependencies/stable-baselines3/`: A slightly modified version of Stable Baselines (fix with gymnasium==1.0.0a2), not by the authors of this repository
 - `dependencies/masksembles/`: Masksembles implementation, not by the authors of this repository
+- `dependencies/imitation/`: Slightly adapted/stripped down version of the [imitation package](https://github.com/HumanCompatibleAI/imitation)
 
 ## Main Components
 
@@ -104,7 +104,7 @@ and more...
 ## Supported Environments
 
 - Mujoco
-- Procgen
+- Procgen available in `dependency/procgen`: Fork of Procgen with Gymnasium support
 - Atari
 - potentially other Gym environments
 
