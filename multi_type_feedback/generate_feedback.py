@@ -347,7 +347,6 @@ def generate_feedback(
     """Generate agent's observations and feedback in the training environment."""
     feedback_id = f"{algorithm}_{environment_name.replace('/', '-')}"
 
-    print(os.listdir(os.path.join(checkpoints_path, algorithm)))
     possible_checkpoint_indices = [
         str(model_dir.split("_")[-1])
         for model_dir in os.listdir(os.path.join(checkpoints_path, algorithm))
@@ -637,7 +636,7 @@ def main():
     parser.add_argument(
         "--n-steps-factor",
         type=int,
-        default=20,
+        default=10,
         help="Number of steps sampled for each feedback instance",
     )
     parser.add_argument(

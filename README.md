@@ -47,7 +47,7 @@ Note: The script looks in the gt_agents folder for trained agents. It expects th
 For demonstrative feedback, we utilize random feedback for simulated preference pairs. To generate the random samples, you need to run a separate script:
 
 ```bash
-python multi_type_feedback/generate_samples.py --algorithm <ppo|sac> --environment <env> --n-feedback 10000 --random
+python multi_type_feedback/generate_samples.py --algorithm <ppo|sac> --environment HalfCheetah-v5 --n-samples 5000 --random
 ```
 
 This script generates random samples in a separate `samples` directory. If you encounter errors like `FileNotFoundError: [Errno 2] No such file or directory: 'samples/random_HalfCheetah-v5.pkl`, be sure first to run the random sample generation script.
