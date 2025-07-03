@@ -155,7 +155,12 @@ def main():
         default="reward_models",
         help="Save folder for trained reward models",
     )
+    parser.add_argument(
+        "--cuda_num", type=str,
+    )
     args = parser.parse_args()
+    os.environ["CUDA_VISIBLE_DEVICES"] = args.cuda_num
+    args.RM_alg = args.algorithm
 
     TrainingUtils.set_seeds(args.seed)
     environment = TrainingUtils.setup_environment(

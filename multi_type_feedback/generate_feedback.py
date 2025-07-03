@@ -503,7 +503,7 @@ def generate_feedback(
 
         for exp_model_index, (expert_model, exp_norm_env) in enumerate(expert_models):
             _, _ = environment.reset()
-            obs = environment.load_state(state)
+            obs = environment.load_state(state) # NOTE reset env with state
 
             demo = []
             for _ in range(segment_len):
@@ -663,7 +663,11 @@ def main():
         default="gt_agents",
         help="Expert model base path",
     )
+    parser.add_argument(
+        "--cuda_num", type=str,
+    )
     args = parser.parse_args()
+    os.environ["CUDA_VISIBLE_DEVICES"] = args.cuda_num
 
     TrainingUtils.set_seeds(args.seed)
     device = TrainingUtils.get_device()
@@ -710,7 +714,7 @@ def main():
         algorithm=args.algorithm,
         device=device,
         action_one_hot=isinstance(environment.action_space, gym.spaces.Discrete),
-    )
+    )    
 
     feedback_path.parent.mkdir(parents=True, exist_ok=True)
     with open(feedback_path, "wb") as f:

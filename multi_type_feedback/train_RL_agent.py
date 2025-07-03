@@ -115,10 +115,18 @@ def main():
     parser.add_argument(
         "--feedback-type", type=str, default="evaluative", help="Type of feedback"
     )
+    parser.add_argument(
+        "--RM_alg", type=str,
+    )
+    parser.add_argument(
+        "--cuda_num", type=str,
+    )
     args = parser.parse_args()
+    os.environ["CUDA_VISIBLE_DEVICES"] = args.cuda_num
 
     TrainingUtils.set_seeds(args.seed)
     _, model_id = TrainingUtils.get_model_ids(args)
+    # model_id = args.RM_alg
     reward_model_path = (
         os.path.join(args.reward_model_folder, f"{model_id}.ckpt")
         if args.feedback_type != "baseline"
@@ -150,7 +158,7 @@ def main():
         seed=args.seed,
         log_interval=-1,
         reward_function=(
-            CustomReward(
+            CustomReward( # 直接把reward model融入env.step里，rlhf的时候直接替代环境内部的reward
                 reward_model_cls=architecture_cls,
                 reward_model_path=reward_model_path,
                 action_is_discrete=action_is_discrete,

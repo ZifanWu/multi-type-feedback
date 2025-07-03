@@ -119,7 +119,7 @@ class TrainingUtils:
             if "ALE" not in args.environment
             else args.environment.replace("/", "-")
         )
-        feedback_id = f"{args.algorithm}_{env_name}_{args.seed}"
+        feedback_id = f"{args.RM_alg}_{env_name}_{args.seed}" # NOTE changed algorithm to RM_alg
         model_id = (
             f"{feedback_id}_{getattr(args, 'feedback_type', 'default')}_{args.seed}"
         )
@@ -213,6 +213,13 @@ class TrainingUtils:
             monitor_gym=False,
             save_code=False,
         )
+
+
+def create_optim_groups(params, lr):
+    """Create optimizer groups for the given parameters and optimizer kwargs."""
+    return [
+        {"params": [p for p in params if p.requires_grad], "lr": lr}
+    ]
 
 
 def get_project_root() -> Path:
