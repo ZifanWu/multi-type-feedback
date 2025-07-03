@@ -19,14 +19,14 @@ This repository contains code for training and evaluating reinforcement learning
 Trains PPO agents in various environments:
 
 ```bash
-python train_baselines/train.py --algo ppo --env <environment> --verbose 0 --save-freq <frequency> --seed <seed> --gym-packages procgen ale_py --log-folder gt_agents
+python train_baselines/train.py --algo ppo --env <environment> --verbose 0 --save-freq <frequency> --gym-packages procgen ale_py --log-folder gt_agents --seed <seed> --cuda_num 0
 ```
 
 In the paper, we trained the Mujoco environments HalfCheetah-v5, Swimmer-v5, and Walker2d-v5, as well as the Highway-env environments with PPO.
 We recommend to train other continuous control environments, including Ant-v5, Hopper-v5, Humanoid-v5 and Metaworld environments with SAC:
 
 ```bash
-python train_baselines/train.py --algo sac --env <Ant-v5|Hopper-v5|metaworld-sweep-into-v2|...> --verbose 0 --save-freq <frequency> --seed <seed> --gym-packages procgen ale_py --log-folder gt_agents
+python train_baselines/train.py --algo sac --env <Ant-v5|Hopper-v5|metaworld-sweep-into-v2|...> --verbose 0 --save-freq <frequency> --gym-packages procgen ale_py --log-folder gt_agents --seed <seed> --cuda_num 0
 ```
 
 Environments: Ant-v5, Swimmer-v5, HalfCheetah-v5, Hopper-v5, Atari, Procgen, ...
@@ -37,7 +37,7 @@ Info: Please use gt_agents as the log folder to ensure compatibility with the ge
 Generates feedback for trained agents:
 
 ```bash
-python multi_type_feedback/generate_feedback.py --algorithm ppo --environment <env> --seed <seed> --n-feedback 10000 --save-folder feedback
+python multi_type_feedback/generate_feedback.py --algorithm ppo --environment <env>  --n-feedback 10000 --save-folder feedback --seed <seed> --cuda_num 0
 ```
 
 Note: The script looks in the gt_agents folder for trained agents. It expects that the `python train_baselines/train_baselines/benchmark.py` script has been run to generate the evaluation scores.
@@ -57,7 +57,7 @@ This script generates random samples in a separate `samples` directory. If you e
 Trains reward models based on generated feedback:
 
 ```bash
-python multi_type_feedback/train_reward_model.py --algorithm ppo --environment <env> --feedback-type <type> --seed <seed> --feedback-folder feedback --save-folder reward_models
+python multi_type_feedback/train_reward_model.py --algorithm ppo --environment <env> --feedback-type <type> --feedback-folder feedback --save-folder reward_models --seed <seed> --cuda_num 0
 ```
 
 Feedback types: evaluative, comparative, demonstrative, corrective, descriptive, descriptive_preference
@@ -67,7 +67,7 @@ Feedback types: evaluative, comparative, demonstrative, corrective, descriptive,
 Trains agents using the learned reward models:
 
 ```bash
-python multi_type_feedback/train_RL_agent.py --algorithm ppo --environment <env> --feedback-type <type> --seed <seed>
+python multi_type_feedback/train_RL_agent.py --algorithm ppo --environment <env> --feedback-type <type> --seed <seed> --cuda_num 0
 ```
 
 ### 5. Agent Training with Learned Reward Function Ensemble (`multi_type_feedback/train_agent_ensemble.py`)
@@ -75,7 +75,7 @@ python multi_type_feedback/train_RL_agent.py --algorithm ppo --environment <env>
 Trains agents using the learned reward models:
 
 ```bash
-python multi_type_feedback/train_RL_agent_with_ensemble.py --algorithm ppo --environment <env> --feedback-types <types> --seed <seed>
+python multi_type_feedback/train_RL_agent_with_ensemble.py --algorithm ppo --environment <env> --feedback-types <types> --seed <seed> --cuda_num 0
 ```
 
 Feedback types: evaluative, comparative, demonstrative, corrective, descriptive, descriptive_preference
